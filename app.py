@@ -89,7 +89,7 @@ if uploaded_file:
     img_array = np.array(img, dtype=np.float32) / 255.0
     img_array = np.expand_dims(img_array, axis=0)
 
-    if st.button("🔍 Prediksi"):
+    if st.button("🔍 Deteksi"):
         with st.spinner("Menganalisis gambar..."):
             interpreter.set_tensor(input_details[0]["index"], img_array)
             interpreter.invoke()
@@ -126,4 +126,4 @@ if data:
     counts = [d[1] for d in data]
     st.bar_chart(dict(zip(labels, counts)))
 else:
-    st.info("Belum ada data prediksi")
+    st.info("Belum ada data Deteksi")
