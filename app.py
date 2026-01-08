@@ -57,14 +57,20 @@ def make_gradcam_heatmap(img_array, model, last_conv_layer_name="Conv_1"):
     )
 
     with tf.GradientTape() as tape:
-        conv_output, preds = grad_model(img_array)
-        loss = preds[:, 0]
+        conv_outputs, preds = grad_model(img_array)
 
-    grads = tape.gradient(loss, conv_output)
+        # === FIX UTAMA DI SINI ===
+        if preds.shape[-1] == 1:
+            loss = preds[:, 0]          # sigmoid
+        else:
+            class_idx = tf.argmax(preds[0])
+            loss = preds[:, class_idx]  # softmax
+
+    grads = tape.gradient(loss, conv_outputs)
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
 
-    conv_output = conv_output[0]
-    heatmap = conv_output @ pooled_grads[..., tf.newaxis]
+    conv_outputs = conv_outputs[0]
+    heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
     heatmap = tf.squeeze(heatmap)
 
     heatmap = tf.maximum(heatmap, 0)
