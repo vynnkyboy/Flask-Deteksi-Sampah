@@ -1,110 +1,128 @@
-from flask import Flask, render_template, request
+import streamlit as st
 import tensorflow as tf
 import numpy as np
-from tensorflow.keras.preprocessing import image
-import os
 import cv2
+import os
 import sqlite3
+from PIL import Image
 
-app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'static/uploads'
+# ================= CONFIG =================
+st.set_page_config(
+    page_title="Deteksi Sampah CNN",
+    page_icon="🗑️",
+    layout="centered"
+)
 
-model = tf.keras.models.load_model("model_mobilenet_sampah.h5")
 IMG_SIZE = 224
+DB_NAME = "prediksi.db"
+
+# ================= LOAD MODEL =================
+@st.cache_resource
+def load_model():
+    return tf.keras.models.load_model("model_mobilenet_sampah.h5")
+
+model = load_model()
 
 # ================= DATABASE =================
-def log_prediction(label, confidence):
-    conn = sqlite3.connect('prediksi.db')
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    c.execute('''
+    c.execute("""
         CREATE TABLE IF NOT EXISTS prediksi (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             label TEXT,
             confidence REAL
         )
-    ''')
-    c.execute("INSERT INTO prediksi (label, confidence) VALUES (?, ?)",
-              (label, confidence))
+    """)
     conn.commit()
     conn.close()
 
+def log_prediction(label, confidence):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO prediksi (label, confidence) VALUES (?, ?)",
+        (label, confidence)
+    )
+    conn.commit()
+    conn.close()
+
+init_db()
+
 # ================= GRAD-CAM =================
-def make_gradcam_heatmap(img_array, model, last_conv_layer_name):
+def make_gradcam_heatmap(img_array, model, last_conv_layer_name="Conv_1"):
     grad_model = tf.keras.models.Model(
-        [model.inputs],
+        model.inputs,
         [model.get_layer(last_conv_layer_name).output, model.output]
     )
 
     with tf.GradientTape() as tape:
-        conv_outputs, predictions = grad_model(img_array)
-        loss = predictions[:, 0]
+        conv_output, preds = grad_model(img_array)
+        loss = preds[:, 0]
 
-    grads = tape.gradient(loss, conv_outputs)
+    grads = tape.gradient(loss, conv_output)
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
 
-    conv_outputs = conv_outputs[0]
-    heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
+    conv_output = conv_output[0]
+    heatmap = conv_output @ pooled_grads[..., tf.newaxis]
     heatmap = tf.squeeze(heatmap)
 
-    heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
+    heatmap = tf.maximum(heatmap, 0)
+    heatmap /= tf.reduce_max(heatmap) + 1e-10
+
     return heatmap.numpy()
 
-def save_gradcam(img_path, heatmap, cam_path="static/heatmap.jpg", alpha=0.4):
-    img = cv2.imread(img_path)
+def overlay_heatmap(img, heatmap, alpha=0.4):
     img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
-
     heatmap = cv2.resize(heatmap, (IMG_SIZE, IMG_SIZE))
     heatmap = np.uint8(255 * heatmap)
     heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+    return cv2.addWeighted(img, 1 - alpha, heatmap, alpha, 0)
 
-    output = heatmap * alpha + img
-    cv2.imwrite(cam_path, output)
+# ================= UI =================
+st.title("🗑️ Deteksi Sampah Menggunakan CNN")
+st.write("Upload gambar sampah untuk diklasifikasikan")
 
-# ================= ROUTES =================
-@app.route('/', methods=['GET', 'POST'])
-def index():
-    if request.method == 'POST':
-        file = request.files['image']
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
-        file.save(filepath)
+uploaded_file = st.file_uploader("Upload gambar", type=["jpg", "png", "jpeg"])
 
-        img = image.load_img(filepath, target_size=(IMG_SIZE, IMG_SIZE))
-        img_array = image.img_to_array(img) / 255.0
-        img_array = np.expand_dims(img_array, axis=0)
+if uploaded_file:
+    image_pil = Image.open(uploaded_file).convert("RGB")
+    st.image(image_pil, caption="Gambar Input", use_container_width=True)
 
-        pred = model.predict(img_array)[0][0]
-        confidence = pred if pred > 0.5 else 1 - pred
-        label = "Sampah Organik" if pred > 0.5 else "Sampah Anorganik"
+    img = np.array(image_pil.resize((IMG_SIZE, IMG_SIZE))) / 255.0
+    img_array = np.expand_dims(img, axis=0)
 
-        # Grad-CAM
-        heatmap = make_gradcam_heatmap(img_array, model, "Conv_1")
-        save_gradcam(filepath, heatmap)
+    if st.button("🔍 Prediksi"):
+        with st.spinner("Menganalisis gambar..."):
+            pred = model.predict(img_array)[0][0]
+            label = "Sampah Organik" if pred > 0.5 else "Sampah Anorganik"
+            confidence = pred if pred > 0.5 else 1 - pred
+            confidence = round(confidence * 100, 2)
 
-        # Log ke database
-        log_prediction(label, round(confidence * 100, 2))
+            log_prediction(label, confidence)
 
-        return render_template(
-            'result.html',
-            label=label,
-            confidence=round(confidence * 100, 2),
-            image_path=filepath,
-            heatmap_path="static/heatmap.jpg"
-        )
+            st.success(f"**{label}**")
+            st.metric("Confidence", f"{confidence}%")
 
-    return render_template('index.html')
+            # Grad-CAM
+            heatmap = make_gradcam_heatmap(img_array, model)
+            cam = overlay_heatmap((img * 255).astype("uint8"), heatmap)
 
-@app.route('/dashboard')
-def dashboard():
-    conn = sqlite3.connect('prediksi.db')
-    c = conn.cursor()
-    c.execute("SELECT label, COUNT(*) FROM prediksi GROUP BY label")
-    data = c.fetchall()
-    conn.close()
+            st.image(cam, caption="Grad-CAM Visualization", use_container_width=True)
 
+# ================= DASHBOARD =================
+st.divider()
+st.subheader("📊 Statistik Prediksi")
+
+conn = sqlite3.connect(DB_NAME)
+c = conn.cursor()
+c.execute("SELECT label, COUNT(*) FROM prediksi GROUP BY label")
+data = c.fetchall()
+conn.close()
+
+if data:
     labels = [d[0] for d in data]
     counts = [d[1] for d in data]
-
-    return render_template('dashboard.html', labels=labels, counts=counts)
-
-if __name__ == '__main__':
-    app.run(debug=True)
+    st.bar_chart(dict(zip(labels, counts)))
+else:
+    st.info("Belum ada data prediksi")
